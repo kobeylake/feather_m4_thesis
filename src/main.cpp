@@ -11,6 +11,9 @@
 #include <FreeRTOS.h>
 #include <FreeRTOS_SAMD51.h>
 #include <ACANFD_FeatherM4CAN.h>
+#include <task.h>
+#include <SPI.h>
+
 
 //**************************************************************************
 // Type Defines and Constants
