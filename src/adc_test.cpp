@@ -38,11 +38,13 @@ void ADC_Init(uint8_t arduinoPin) {
   while (ADC0->CTRLA.bit.SWRST) {}
 
   // 4) Prescaler (slow & stable)
-  ADC0->CTRLA.reg = ADC_CTRLA_PRESCALER_DIV128;
+  ADC0->CTRLA.reg = ADC_CTRLA_PRESCALER_DIV256;
   wait_sync_all();
 
   // 5) Reference: use external AREF (≈3.3 V on Feather M4)
-  ADC0->REFCTRL.reg = ADC_REFCTRL_REFSEL_AREFA;
+  ADC0->REFCTRL.reg = ADC_REFCTRL_REFSEL_INTVCC1;
+  ADC0->REFCTRL.bit.REFCOMP = 1;
+  while (ADC0->SYNCBUSY.bit.REFCTRL) {}
   wait_sync_all();
 
   // 6) 12-bit, single-shot
@@ -51,10 +53,10 @@ void ADC_Init(uint8_t arduinoPin) {
   ADC0->CTRLB.bit.FREERUN = 0;
   while (ADC0->SYNCBUSY.bit.CTRLB) {}
 
-  // 7) Sample time (a little longer for stability), no averaging (keep simple)
-  ADC0->SAMPCTRL.bit.SAMPLEN = 15;
+  // 7) Sample time (a little longer for stability) and averging
+  ADC0->SAMPCTRL.bit.SAMPLEN = 63;
   while (ADC0->SYNCBUSY.bit.SAMPCTRL) {}
-  ADC0->AVGCTRL.reg = ADC_AVGCTRL_SAMPLENUM_1 | ADC_AVGCTRL_ADJRES(0);
+  ADC0->AVGCTRL.reg = ADC_AVGCTRL_SAMPLENUM_16 | ADC_AVGCTRL_ADJRES(4);
   while (ADC0->SYNCBUSY.bit.AVGCTRL) {}
 
   // 8) Map Arduino pin -> correct ADC channel from variant table
@@ -68,6 +70,7 @@ void ADC_Init(uint8_t arduinoPin) {
   // 9) Enable ADC
   ADC0->CTRLA.bit.ENABLE = 1;
   while (ADC0->SYNCBUSY.bit.ENABLE) {}
+  delayMicroseconds(50);
 }
 
 void setup() {
@@ -90,7 +93,7 @@ void loop() {
 
   uint16_t v;
   if (adc_convert_once(v)) {
-    last = v;
+    last = v - 10; // offset at 0V
     samples++;
   } else {
     // show a one-off hint if conversion didn't complete
