@@ -2,12 +2,8 @@
 #define BMI3_ARDUINO_COMMON_H
 
 #include <Arduino.h>
-#include <SPI.h>
+#include <Wire.h>
 #include "bmi323.h"
-
-// Expose CS pin and SPI settings so other files can use them
-extern const int BMI3_PIN_CS;
-extern SPISettings bmiSPI;
 
 // Interface init/deinit
 int8_t bmi3_interface_init(struct bmi3_dev *dev, uint8_t intf);
