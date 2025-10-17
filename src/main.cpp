@@ -1,7 +1,7 @@
 //**************************************************************************
 // FreeRTOS on SAME51 (Feather M4 CAN)
 // Original: Scott Briscoe
-// Modified: Added LED blink task
+// Modified: Added ...
 //**************************************************************************
 
 #define CAN0_MESSAGE_RAM_SIZE (0)
@@ -12,9 +12,10 @@
 #include <FreeRTOS_SAMD51.h>
 #include <ACANFD_FeatherM4CAN.h>
 #include <task.h>
-#include <SPI.h>
+#include <Wire.h>
+#include "bmi323.h"
+#include "bmi3_arduino_common.h"
 #include "wiring_private.h"   // for g_APinDescription, pinPeripheral()
-
 
 
 
@@ -28,6 +29,8 @@
 
 // ADC PIN
 #define ADC_PIN   A1       // A1 to avoid A0/DAC functionality
+#define ADC_PIN2  A2
+
 
 // static CANFDMessage can_message;
 
@@ -37,12 +40,14 @@
 //**************************************************************************
 // Global variables
 //**************************************************************************
-TaskHandle_t Handle_aTask;
+TaskHandle_t Handle_accelTask;
 TaskHandle_t Handle_ADCTask;
 TaskHandle_t Handle_monitorTask;
-TaskHandle_t Handle_ledTask;
 TaskHandle_t Handle_canTxTask;
 volatile u_int16_t adc_1; 
+volatile u_int16_t adc_2;
+volatile u_int16_t accel_x[6400];
+volatile u_int16_t accel_y[6400];
 
 
 //**************************************************************************
@@ -53,6 +58,14 @@ typedef struct __attribute__((packed)) {
 	uint16_t lvdt_left;
 } LvdtFrame_t;
 
+
+//**************************************************************************
+// Accelerometer struct
+//**************************************************************************
+typedef struct __attribute__((packed)) {
+	uint16_t acc_x[6400];
+	uint16_t acc_y[6400];
+} AccFrame_t;
 
 //**************************************************************************
 // Delay helpers
@@ -144,12 +157,16 @@ void ADC_Init(uint8_t arduinoPin) {
   myDelayMs(50);
 }
 
+
+//**************************************************************************
+// Helper to construct and send CAN Message
+//**************************************************************************
 int send_can_msg(u_int16_t can_id, u_int8_t can_msg_len, u_int8_t *data, u_int8_t data_len) {
     if ((can_msg_len < 0) || (can_msg_len > 64) || (data_len > can_msg_len)) {
         return 2; // failure, data too long
     }
  
-    CANFDMessage can_message;
+    static CANFDMessage can_message;
     can_message.idx = 0;
     can_message.ext = false;
     can_message.type = CANFDMessage::CANFD_WITH_BIT_RATE_SWITCH;
@@ -176,21 +193,19 @@ int send_can_msg(u_int16_t can_id, u_int8_t can_msg_len, u_int8_t *data, u_int8_
 //*****************************************************************
 // Thread A: Prints "A" every 500 ms for 100 times, then deletes itself
 //*****************************************************************
-static void threadA(void *pvParameters) 
+static void threadAccel(void *pvParameters) 
 {
-  Serial.println("Thread A: Started");
-  for (int x = 0; x < 100; ++x)
+  Serial.println("Thread Acc: Started");
+  while(1)
   {
-    Serial.print("A");
+    Serial.print("ignore");
     Serial.flush();
-    myDelayMs(500);
+    myDelayMs(100);
   }
-  Serial.println("Thread A: Deleting");
-  vTaskDelete(NULL);
 }
 
 //*****************************************************************
-// Thread B: Prints "B" every 2 seconds forever
+// Thread ADC : Prints ADC value every 2 seconds forever
 //*****************************************************************
 static void threadADC(void *pvParameters) 
 {
@@ -216,11 +231,24 @@ static void threadADC(void *pvParameters)
       Serial.print("ADC Raw: "); Serial.print(adc_1);
       Serial.print("   Voltage: "); Serial.print(voltage, 4);
       Serial.println(" V");
+
     } else {
       Serial.println("ADC timeout or read error");
     }
 
-    vTaskDelayUntil(&lastWakeTime, pdMS_TO_TICKS(2500));  // 2 Hz sampling rate
+    
+      // debugging LED
+      if (adc_1 > 2000) {
+        // rgb led on
+        digitalWrite(LED_BUILTIN, LOW);
+      }
+      if (adc_1 <= 2000) {
+        // rgb led off
+        digitalWrite(LED_BUILTIN, HIGH);
+      }
+
+
+    vTaskDelayUntil(&lastWakeTime, pdMS_TO_TICKS(2500));  // sample every 2.5sec
   }
   // while (1)
   // {
@@ -230,24 +258,10 @@ static void threadADC(void *pvParameters)
   // }
 }
 
-//*****************************************************************
-// LED Blink Task: Toggles LED_BUILTIN every 500 ms forever
-//*****************************************************************
-static void ledTask(void *pvParameters)
-{
-  pinMode(LED_BUILTIN, OUTPUT);
 
-  Serial.println("LED Blink Task: Started");
-  
-  while (1)
-  {
-    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-    myDelayMs(500);
-  }
-}
 
 //*****************************************************************
-// CAN TX Task: Sends "testing" message every second
+// CAN TX Task: Sends status of LVDT every second
 //*****************************************************************
 static void canTxTask(void *pvParameters) {
   Serial.println("CAN TX Task: Started");
@@ -255,7 +269,7 @@ static void canTxTask(void *pvParameters) {
 
    while (1) {
     // send lvdt vals
-    LvdtFrame_t vals; 
+    static LvdtFrame_t vals; 
     vals.lvdt_left = 1; 
     vals.lvdt_right = adc_1; // adc value here
     int error = send_can_msg(0x22, 8, (u_int8_t*)&vals, sizeof(vals));
@@ -267,29 +281,6 @@ static void canTxTask(void *pvParameters) {
     Serial.println(adc_1);
    }
   
-
-
-
-  // // Initialize CAN at 500 kbps
-  // if (!CAN.begin(500E3)) {
-  //   Serial.println("Starting CAN failed!");
-  //   vTaskDelete(NULL);
-  // }
-
-  // while (1) {
-  //   CAN.beginPacket(0x123); // Arbitrary CAN ID
-  //   CAN.write('t');
-  //   CAN.write('e');
-  //   CAN.write('s');
-  //   CAN.write('t');
-  //   CAN.write('i');
-  //   CAN.write('n');
-  //   CAN.write('g');
-  //   CAN.endPacket();
-
-  //   Serial.println("Sent CAN message: testing");
-  //   myDelayMs(1000);
-  // }
 }
 
 //*****************************************************************
@@ -333,8 +324,8 @@ void taskMonitor(void *pvParameters)
     Serial.println("****************************************************");
     Serial.println("[Stacks Free Bytes Remaining] ");
 
-    measurement = uxTaskGetStackHighWaterMark(Handle_aTask);
-    Serial.print("Thread A: ");
+    measurement = uxTaskGetStackHighWaterMark(Handle_accelTask);
+    Serial.print("Thread Accel: ");
     Serial.println(measurement);
 
     measurement = uxTaskGetStackHighWaterMark(Handle_ADCTask);
@@ -343,10 +334,6 @@ void taskMonitor(void *pvParameters)
 
     measurement = uxTaskGetStackHighWaterMark(Handle_monitorTask);
     Serial.print("Monitor Stack: ");
-    Serial.println(measurement);
-
-    measurement = uxTaskGetStackHighWaterMark(Handle_ledTask);
-    Serial.print("LED Task: ");
     Serial.println(measurement);
 
     measurement = uxTaskGetStackHighWaterMark(Handle_canTxTask);
@@ -374,6 +361,13 @@ void setup()
   Serial.println("        Program start         ");
   Serial.println("******************************");
 
+  // debugging LED 
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  // Start with LED off
+  digitalWrite(LED_BUILTIN, LOW);
+
+
   vSetErrorLed(ERROR_LED_PIN, ERROR_LED_LIGHTUP_STATE);
   vSetErrorSerial(&Serial);
 
@@ -398,10 +392,11 @@ void setup()
   settings.mDataSJW                   = 1;
   can1.beginFD(settings);
 
-  xTaskCreate(threadA,     "Task A",       256, NULL, tskIDLE_PRIORITY + 3, &Handle_aTask);
+
+  // Create tasks and start kernal
+  xTaskCreate(threadAccel,     "Task Accelerometer",       256, NULL, tskIDLE_PRIORITY + 3, &Handle_accelTask);
   xTaskCreate(threadADC,     "Task ADC",       256, NULL, tskIDLE_PRIORITY + 2, &Handle_ADCTask);
   xTaskCreate(taskMonitor, "Task Monitor", 512, NULL, tskIDLE_PRIORITY + 1, &Handle_monitorTask);
-  xTaskCreate(ledTask,     "LED Blink",    128, NULL, tskIDLE_PRIORITY + 1, &Handle_ledTask);
   xTaskCreate(canTxTask,   "CAN TX",       512, NULL, tskIDLE_PRIORITY + 2, &Handle_canTxTask);
 
   vTaskStartScheduler();
@@ -418,6 +413,6 @@ void setup()
 //*****************************************************************
 void loop() 
 {
-  Serial.print(".");
+  //Serial.print(".");
   delay(100);
 }
