@@ -12,6 +12,7 @@
 #include <FreeRTOS_SAMD51.h>
 #include <ACANFD_FeatherM4CAN.h>
 #include <task.h>
+#include <semphr.h>
 #include <Wire.h>
 #include "bmi323.h"
 #include "bmi3_arduino_common.h"
@@ -43,11 +44,15 @@
 TaskHandle_t Handle_accelTask;
 TaskHandle_t Handle_ADCTask;
 TaskHandle_t Handle_monitorTask;
-TaskHandle_t Handle_canTxTask;
+TaskHandle_t Handle_canADCTxTask;
+TaskHandle_t Handle_canAccelTxTask;
+
+SemaphoreHandle_t accelDataMutex;
+
 volatile u_int16_t adc_1; 
 volatile u_int16_t adc_2;
-volatile u_int16_t accel_x[6400];
-volatile u_int16_t accel_y[6400];
+volatile u_int16_t accel_x[3200];
+volatile u_int16_t accel_y[3200];
 
 static bmi3_dev dev = {0};
 
@@ -64,8 +69,8 @@ typedef struct __attribute__((packed)) {
 // Accelerometer struct
 //**************************************************************************
 typedef struct __attribute__((packed)) {
-	uint16_t acc_x[6400];
-	uint16_t acc_y[6400];
+	int16_t acc_x[3200];
+	int16_t acc_y[3200];
 } AccFrame_t;
 
 //**************************************************************************
@@ -229,33 +234,70 @@ int send_can_msg(u_int16_t can_id, u_int8_t can_msg_len, u_int8_t *data, u_int8_
 
 
 //*****************************************************************
-// Thread A: Prints "A" every 500 ms for 100 times, then deletes itself
+// Thread Accel : Reads accelerometer data and fills in the global arrays
 //*****************************************************************
 static void threadAccel(void *pvParameters) 
 {
   Serial.println("Thread Acc: Started");
   while(1)
   {
-     static uint16_t idx = 0;
-  uint16_t int_status = 0;
+    static uint16_t idx = 0;
+    uint16_t int_status = 0;
 
-  if (bmi323_get_int1_status(&int_status, &dev) == BMI323_OK) {
-    if (int_status & BMI3_INT_STATUS_ACC_DRDY) {
-      bmi3_sensor_data sd = {0};
-      sd.type = BMI323_ACCEL;
-      if (bmi323_get_sensor_data(&sd, 1, &dev) == BMI323_OK) {
-        float gx = lsb_to_g(sd.sens_data.acc.x, 2.0f, dev.resolution);
-        float gy = lsb_to_g(sd.sens_data.acc.y, 2.0f, dev.resolution);
-        float gz = lsb_to_g(sd.sens_data.acc.z, 2.0f, dev.resolution);
-        Serial.print(idx); Serial.print(',');
-        Serial.print(gx, 4); Serial.print(',');
-        Serial.print(gy, 4); Serial.print(',');
-        Serial.println(gz, 4);
-        idx++;
+    if( xSemaphoreTake( accelDataMutex, ( TickType_t ) 5 ) == pdTRUE ) {
+      if (bmi323_get_int1_status(&int_status, &dev) == BMI323_OK) {
+        if (int_status & BMI3_INT_STATUS_ACC_DRDY) {
+          bmi3_sensor_data sd = {0};
+          sd.type = BMI323_ACCEL;
+          if (bmi323_get_sensor_data(&sd, 1, &dev) == BMI323_OK) {
+
+            // store raw values in global arrays
+            accel_x[idx] = sd.sens_data.acc.x;
+            accel_y[idx] = sd.sens_data.acc.y;
+            idx++;
+
+            // wrap around when we hit 3200 samples
+            if (idx >= 3200) {
+              idx = 0;
+              Serial.println("Accel buffer full, wrapping around");
+            }
+
+            
+
+             if (idx % 100 == 0) {
+              float gx = lsb_to_g(sd.sens_data.acc.x, 2.0f, dev.resolution);
+              float gy = lsb_to_g(sd.sens_data.acc.y, 2.0f, dev.resolution);
+              float gz = lsb_to_g(sd.sens_data.acc.z, 2.0f, dev.resolution);
+              Serial.print("Sample ");
+              Serial.print(idx);
+              Serial.print(": ");
+
+              // raw values
+              Serial.print("Raw [");
+              Serial.print(sd.sens_data.acc.x);
+              Serial.print(", ");
+              Serial.print(sd.sens_data.acc.y);
+              Serial.print(", ");
+              Serial.print(sd.sens_data.acc.z);
+              Serial.print("]  ");
+
+              // converted g-values
+              Serial.print("G [");
+              Serial.print(gx, 4);
+              Serial.print(", ");
+              Serial.print(gy, 4);
+              Serial.print(", ");
+              Serial.print(gz, 4);
+              Serial.println("]");
+            }
+
+          }
+        }
       }
+      xSemaphoreGive(accelDataMutex);
     }
-  }
-  myDelayMs(500);
+    myDelayUs(100);  // 100us delay gives other tasks a chance to run
+
   }
 }
 
@@ -316,10 +358,10 @@ static void threadADC(void *pvParameters)
 
 
 //*****************************************************************
-// CAN TX Task: Sends status of LVDT every second
+// CAN TX Task: Sends status of LVDT every 2 second
 //*****************************************************************
-static void canTxTask(void *pvParameters) {
-  Serial.println("CAN TX Task: Started");
+static void canADCTxTask(void *pvParameters) {
+  Serial.println("CAN ADC TX Task: Started");
   
 
    while (1) {
@@ -329,7 +371,7 @@ static void canTxTask(void *pvParameters) {
     vals.lvdt_right = adc_1; // adc value here
     int error = send_can_msg(0x22, 8, (u_int8_t*)&vals, sizeof(vals));
     if (error == 1) {
-      Serial.println("CAN TX fail");
+      Serial.println("CAN TX fail (LVDT)");
     }
     myDelayMs(2000);
     Serial.print("adc val canTX:");
@@ -337,6 +379,63 @@ static void canTxTask(void *pvParameters) {
    }
   
 }
+
+
+//*****************************************************************
+// CAN TX Accel Task: Sends accelerometer data every 30 sec
+//*****************************************************************
+static void canAccelTxTask(void *pvParameters) {
+  Serial.println("CAN Accel TX Task: Started");
+
+  int16_t chunk[32];
+  
+  while (1) {
+    // CAN FD supports up to 64 bytes per message
+    // 64 bytes = 32 uint16_t values per message
+    // we have 3200 samples, so we need 3200/32 = 100 messages per axis
+
+
+    myDelayMs(30000);
+
+    Serial.println("Freezinf buffer to start accel data transmission");
+    xSemaphoreTake(accelDataMutex, portMAX_DELAY);
+
+    
+    // send x-axis data
+    for (int i = 0; i < 3200; i += 32) {
+      for (int j = 0; j < 32; j++) {
+        chunk[j] = accel_x[i + j];
+      }
+      
+      int error = send_can_msg(0x23, 64, (uint8_t*)chunk, sizeof(chunk));
+      if (error == 1) {
+        Serial.println("CAN Accel X TX fail");
+      }
+      myDelayUs(100); // small delay between messages
+    }
+    
+    Serial.println("Sent all X axis data");
+    
+    // send y-axis data
+    for (int i = 0; i < 3200; i += 32) {
+      for (int j = 0; j < 32; j++) {
+        chunk[j] = accel_y[i + j];
+      }
+      
+      int error = send_can_msg(0x24, 64, (uint8_t*)chunk, sizeof(chunk));
+      if (error == 1) {
+        Serial.println("CAN Accel Y TX fail");
+      }
+      myDelayUs(100);
+    }
+    
+    Serial.println("un-freezing buffer after sending all Y axis data");
+    xSemaphoreGive(accelDataMutex);
+    
+    
+  }
+}
+
 
 //*****************************************************************
 // Monitor Task: Prints heap, task stats, and stack usage every 10 s
@@ -391,7 +490,7 @@ void taskMonitor(void *pvParameters)
     Serial.print("Monitor Stack: ");
     Serial.println(measurement);
 
-    measurement = uxTaskGetStackHighWaterMark(Handle_canTxTask);
+    measurement = uxTaskGetStackHighWaterMark(Handle_canADCTxTask);
     Serial.print("CAN TX Task: "); 
     Serial.println(measurement);
 
@@ -462,6 +561,14 @@ void setup()
   vSetErrorLed(ERROR_LED_PIN, ERROR_LED_LIGHTUP_STATE);
   vSetErrorSerial(&Serial);
 
+  // Create mutex for protecting accelerometer data
+  accelDataMutex = xSemaphoreCreateMutex();
+  if (accelDataMutex == NULL) {
+    while(1) {
+      Serial.println("Failed to create mutex!");
+    }    
+  }
+
   // 500kBps arbitration, 4MBps data
   ACANFD_FeatherM4CAN_Settings settings(
     ACANFD_FeatherM4CAN_Settings::CLOCK_48MHz,
@@ -485,10 +592,11 @@ void setup()
 
 
   // Create tasks and start kernal
-  xTaskCreate(threadAccel,     "Task Accelerometer",       256, NULL, tskIDLE_PRIORITY + 3, &Handle_accelTask);
+  xTaskCreate(threadAccel,     "Task Accelerometer",       512, NULL, tskIDLE_PRIORITY + 2, &Handle_accelTask);
   xTaskCreate(threadADC,     "Task ADC",       256, NULL, tskIDLE_PRIORITY + 2, &Handle_ADCTask);
   xTaskCreate(taskMonitor, "Task Monitor", 512, NULL, tskIDLE_PRIORITY + 1, &Handle_monitorTask);
-  xTaskCreate(canTxTask,   "CAN TX",       512, NULL, tskIDLE_PRIORITY + 2, &Handle_canTxTask);
+  xTaskCreate(canADCTxTask,   "CAN ADC TX",       512, NULL, tskIDLE_PRIORITY + 2, &Handle_canADCTxTask);
+  xTaskCreate(canAccelTxTask,   "CAN Accelerometer TX",       1024, NULL, tskIDLE_PRIORITY + 2, &Handle_canAccelTxTask);
 
   vTaskStartScheduler();
 
